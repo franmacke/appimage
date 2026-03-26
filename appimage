@@ -1,0 +1,268 @@
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+#######################################
+# Rutas
+#######################################
+
+USER_ROOT="$HOME/.local/appimages"
+USER_DESKTOP="$HOME/.local/share/applications"
+USER_ICONS="$HOME/.local/share/icons"
+
+SYSTEM_ROOT="/opt/appimages"
+SYSTEM_DESKTOP="/usr/share/applications"
+SYSTEM_ICONS="/usr/share/icons/hicolor/256x256/apps"
+
+#######################################
+# Utils
+#######################################
+
+die() {
+  echo "❌ $*" >&2
+  exit 1
+}
+
+info() {
+  echo "▶ $*"
+}
+
+need_root() {
+  [[ "$EUID" -eq 0 ]] || die "Este comando requiere sudo (--system)"
+}
+
+sanitize_name() {
+  echo "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/[^a-z0-9]+/-/g' \
+    | sed -E 's/^-+|-+$//g'
+}
+
+#######################################
+# INSTALL
+#######################################
+
+cmd_install() {
+  local mode="user"
+  local force="false"
+
+  while [[ "${1:-}" == --* ]]; do
+    case "$1" in
+      --system) mode="system" ;;
+      --force)  force="true" ;;
+      *) die "Flag desconocida: $1" ;;
+    esac
+    shift
+  done
+
+  local src="${1:-}"
+  [[ -f "$src" ]] || die "Archivo inexistente"
+  [[ "$src" == *.AppImage ]] || die "No parece un AppImage"
+
+  [[ "$mode" == "system" ]] && need_root
+
+  local filename base raw_name version app_name
+  filename="$(basename "$src")"
+  base="${filename%.AppImage}"
+
+  # versión = primer bloque X.Y / X.Y.Z
+  version="$(echo "$base" | grep -oE '[0-9]+(\.[0-9]+)+' | head -n1 || true)"
+
+  if [[ -n "$version" ]]; then
+    raw_name="${base%%$version*}"
+  else
+    raw_name="$base"
+    version="unknown"
+  fi
+
+  raw_name="$(echo "$raw_name" | sed -E 's/[-_]+$//')"
+  app_name="$(sanitize_name "$raw_name")"
+
+  [[ -n "$app_name" ]] || die "No se pudo determinar el nombre de la app"
+
+  info "App: $app_name"
+  info "Versión: $version"
+
+  local ROOT DESKTOP_DIR ICON_DIR
+  if [[ "$mode" == "system" ]]; then
+    ROOT="$SYSTEM_ROOT"
+    DESKTOP_DIR="$SYSTEM_DESKTOP"
+    ICON_DIR="$SYSTEM_ICONS"
+  else
+    ROOT="$USER_ROOT"
+    DESKTOP_DIR="$USER_DESKTOP"
+    ICON_DIR="$USER_ICONS"
+  fi
+
+  local app_dir="$ROOT/$app_name/$version"
+  local current_link="$ROOT/$app_name/current"
+
+  if [[ -d "$app_dir" && "$force" != "true" ]]; then
+    die "La versión ya existe. Usá --force para sobrescribir."
+  fi
+
+  info "Instalando en $app_dir"
+  mkdir -p "$app_dir"
+
+  local target="$app_dir/$app_name.AppImage"
+  cp -f "$src" "$target"
+  chmod +x "$target"
+
+  ln -sfn "$version" "$current_link"
+  info "Actualizando symlink current"
+
+  #######################################
+  # Metadata (ícono)
+  #######################################
+
+  info "Extrayendo metadata"
+  local tmpdir icon
+  tmpdir="$(mktemp -d)"
+
+  (cd "$tmpdir" && "$target" --appimage-extract >/dev/null 2>&1 || true)
+
+  icon="$(find "$tmpdir/squashfs-root" \
+    -type f \( -name "*.png" -o -name "*.svg" \) \
+    2>/dev/null | head -n1 || true)"
+
+  if [[ -n "$icon" ]]; then
+    mkdir -p "$ICON_DIR"
+    cp "$icon" "$ICON_DIR/$app_name.png"
+    info "Ícono instalado"
+  else
+    info "Ícono no encontrado"
+  fi
+
+  rm -rf "$tmpdir"
+
+  #######################################
+  # Desktop
+  #######################################
+
+  mkdir -p "$DESKTOP_DIR"
+  local desktop_file="$DESKTOP_DIR/$app_name.desktop"
+
+  info "Creando .desktop"
+  cat > "$desktop_file" <<EOF
+[Desktop Entry]
+Type=Application
+Name=$raw_name
+Exec=appimage run $app_name
+Icon=$app_name
+Terminal=false
+Categories=Utility;
+EOF
+
+  chmod +x "$desktop_file"
+
+  info "✔ Instalación completa"
+}
+
+#######################################
+# RUN
+#######################################
+
+cmd_run() {
+  local mode="user"
+
+  if [[ "${1:-}" == "--system" ]]; then
+    mode="system"
+    shift
+  fi
+
+  local name="${1:-}"
+  local version="${2:-}"
+
+  [[ -n "$name" ]] || die "Uso: appimage run [--system] <app> [version]"
+
+  name="$(sanitize_name "$name")"
+
+  local ROOT
+  if [[ "$mode" == "system" ]]; then
+    ROOT="$SYSTEM_ROOT"
+  else
+    ROOT="$USER_ROOT"
+  fi
+
+  local base="$ROOT/$name"
+  [[ -d "$base" ]] || die "App no instalada: $name"
+
+  local target
+  if [[ -n "${version:-}" ]]; then
+    target="$base/$version/$name.AppImage"
+  else
+    target="$base/current/$name.AppImage"
+  fi
+
+  [[ -x "$target" ]] || die "No existe la versión solicitada"
+
+  info "Ejecutando $name ${version:-current}"
+
+  set +e
+  "$target" "$@" 2> >(tee /tmp/appimage_run_err.log >&2)
+  status=$?
+  set -e
+
+  if grep -q "chrome-sandbox" /tmp/appimage_run_err.log; then
+    info "Detectado sandbox Chromium, reintentando con --no-sandbox"
+    exec "$target" --no-sandbox "$@"
+  fi
+
+  exit $status
+}
+
+#######################################
+# LIST
+#######################################
+
+cmd_list() {
+  local root="$USER_ROOT"
+  [[ "${1:-}" == "--system" ]] && root="$SYSTEM_ROOT"
+  [[ -d "$root" ]] || exit 0
+  find "$root" -mindepth 2 -maxdepth 2 -type d | sed "s|$root/||"
+}
+
+#######################################
+# REMOVE
+#######################################
+
+cmd_remove() {
+  local name="${1:-}"
+  [[ -z "$name" ]] && die "Indicá el nombre de la app"
+
+  name="$(sanitize_name "$name")"
+
+  info "Eliminando $name"
+  rm -rf "$USER_ROOT/$name"
+  rm -f "$USER_DESKTOP/$name.desktop"
+  rm -f "$USER_ICONS/$name.png"
+
+  info "✔ Eliminado"
+}
+
+#######################################
+# MAIN
+#######################################
+
+case "${1:-}" in
+  install) shift; cmd_install "$@" ;;
+  run)     shift; cmd_run "$@" ;;
+  list)    shift; cmd_list "$@" ;;
+  remove)  shift; cmd_remove "$@" ;;
+  *)
+    cat <<EOF
+Uso:
+  appimage install [--system] [--force] archivo.AppImage
+  appimage run [--system] nombre [version]
+  appimage list [--system]
+  appimage remove nombre
+
+Ejemplos:
+  appimage install LM-Studio-0.3.36-1-x64.AppImage
+  appimage run lm-studio
+  appimage run lm-studio 0.3.36
+  sudo appimage install --system krita-5.2.3-x86_64.AppImage
+EOF
+    ;;
+esac
+
